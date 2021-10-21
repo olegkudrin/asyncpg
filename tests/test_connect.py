@@ -7,7 +7,6 @@
 
 import asyncio
 import contextlib
-import gc
 import ipaddress
 import os
 import platform
@@ -16,6 +15,7 @@ import stat
 import tempfile
 import textwrap
 import unittest
+import urllib.parse
 import weakref
 
 import asyncpg
@@ -34,6 +34,9 @@ CERTS = os.path.join(os.path.dirname(__file__), 'certs')
 SSL_CA_CERT_FILE = os.path.join(CERTS, 'ca.cert.pem')
 SSL_CERT_FILE = os.path.join(CERTS, 'server.cert.pem')
 SSL_KEY_FILE = os.path.join(CERTS, 'server.key.pem')
+CLIENT_CA_CERT_FILE = os.path.join(CERTS, 'client_ca.cert.pem')
+CLIENT_SSL_CERT_FILE = os.path.join(CERTS, 'client.cert.pem')
+CLIENT_SSL_KEY_FILE = os.path.join(CERTS, 'client.key.pem')
 
 
 class TestSettings(tb.ConnectedTestCase):
@@ -65,6 +68,9 @@ class TestSettings(tb.ConnectedTestCase):
             ("10.1", (10, 0, 1, 'final', 0),),
             ("11.1.2", (11, 0, 1, 'final', 0),),
             ("PostgreSQL 10.1 (Debian 10.1-3)", (10, 0, 1, 'final', 0),),
+            ("PostgreSQL 11.2-YB-2.7.1.1-b0 on x86_64-pc-linux-gnu, "
+             "compiled by gcc (Homebrew gcc 5.5.0_4) 5.5.0, 64-bit",
+             (11, 0, 2, "final", 0),),
         ]
         for version, expected in versions:
             result = split_server_version_string(version)
@@ -1122,6 +1128,8 @@ class TestConnection(tb.ConnectedTestCase):
             try:
                 con = await self.connect(
                     dsn='postgresql://foo/?sslmode=' + sslmode,
+                    user='postgres',
+                    database='postgres',
                     host='localhost')
                 self.assertEqual(await con.fetchval('SELECT 42'), 42)
                 self.assertFalse(con._protocol.is_ssl)
@@ -1135,6 +1143,8 @@ class TestConnection(tb.ConnectedTestCase):
                 with self.assertRaises(ConnectionError):
                     con = await self.connect(
                         dsn='postgresql://foo/?sslmode=' + sslmode,
+                        user='postgres',
+                        database='postgres',
                         host='localhost')
                     await con.fetchval('SELECT 42')
             finally:
@@ -1165,6 +1175,7 @@ class BaseTestSSLConnection(tb.ConnectedTestCase):
             'ssl': 'on',
             'ssl_cert_file': SSL_CERT_FILE,
             'ssl_key_file': SSL_KEY_FILE,
+            'ssl_ca_file': CLIENT_CA_CERT_FILE,
         })
 
         return conf
@@ -1243,7 +1254,7 @@ class TestSSLConnection(BaseTestSSLConnection):
             con = None
             try:
                 con = await self.connect(
-                    dsn='postgresql://foo/?sslmode=' + sslmode,
+                    dsn='postgresql://foo/postgres?sslmode=' + sslmode,
                     host=host,
                     user='ssl_user')
                 self.assertEqual(await con.fetchval('SELECT 42'), 42)
@@ -1357,6 +1368,72 @@ class TestSSLConnection(BaseTestSSLConnection):
 
 
 @unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')
+class TestClientSSLConnection(BaseTestSSLConnection):
+    def _add_hba_entry(self):
+        self.cluster.add_hba_entry(
+            type='hostssl', address=ipaddress.ip_network('127.0.0.0/24'),
+            database='postgres', user='ssl_user',
+            auth_method='cert')
+
+        self.cluster.add_hba_entry(
+            type='hostssl', address=ipaddress.ip_network('::1/128'),
+            database='postgres', user='ssl_user',
+            auth_method='cert')
+
+    async def test_ssl_connection_client_auth_fails_with_wrong_setup(self):
+        ssl_context = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH,
+            cafile=SSL_CA_CERT_FILE,
+        )
+
+        with self.assertRaisesRegex(
+            exceptions.InvalidAuthorizationSpecificationError,
+            "requires a valid client certificate",
+        ):
+            await self.connect(
+                host='localhost',
+                user='ssl_user',
+                ssl=ssl_context,
+            )
+
+    async def test_ssl_connection_client_auth_custom_context(self):
+        ssl_context = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH,
+            cafile=SSL_CA_CERT_FILE,
+        )
+        ssl_context.load_cert_chain(
+            CLIENT_SSL_CERT_FILE,
+            keyfile=CLIENT_SSL_KEY_FILE,
+        )
+
+        con = await self.connect(
+            host='localhost',
+            user='ssl_user',
+            ssl=ssl_context,
+        )
+
+        try:
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+        finally:
+            await con.close()
+
+    async def test_ssl_connection_client_auth_dsn(self):
+        params = urllib.parse.urlencode({
+            'sslrootcert': SSL_CA_CERT_FILE,
+            'sslcert': CLIENT_SSL_CERT_FILE,
+            'sslkey': CLIENT_SSL_KEY_FILE,
+            'sslmode': 'verify-full',
+        })
+        dsn = 'postgres://ssl_user@localhost/postgres?' + params
+        con = await self.connect(dsn=dsn)
+
+        try:
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+        finally:
+            await con.close()
+
+
+@unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')
 class TestNoSSLConnection(BaseTestSSLConnection):
     def _add_hba_entry(self):
         self.cluster.add_hba_entry(
@@ -1374,7 +1451,7 @@ class TestNoSSLConnection(BaseTestSSLConnection):
             con = None
             try:
                 con = await self.connect(
-                    dsn='postgresql://foo/?sslmode=' + sslmode,
+                    dsn='postgresql://foo/postgres?sslmode=' + sslmode,
                     host=host,
                     user='ssl_user')
                 self.assertEqual(await con.fetchval('SELECT 42'), 42)
@@ -1411,7 +1488,7 @@ class TestNoSSLConnection(BaseTestSSLConnection):
 
     async def test_nossl_connection_prefer_cancel(self):
         con = await self.connect(
-            dsn='postgresql://foo/?sslmode=prefer',
+            dsn='postgresql://foo/postgres?sslmode=prefer',
             host='localhost',
             user='ssl_user')
         self.assertFalse(con._protocol.is_ssl)
@@ -1448,13 +1525,10 @@ class TestConnectionGC(tb.ClusterTestCase):
 
     async def _run_no_explicit_close_test(self):
         con = await self.connect()
+        await con.fetchval("select 123")
         proto = con._protocol
         conref = weakref.ref(con)
         del con
-
-        gc.collect()
-        gc.collect()
-        gc.collect()
 
         self.assertIsNone(conref())
         self.assertTrue(proto.is_closed())
